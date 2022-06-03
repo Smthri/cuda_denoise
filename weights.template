@@ -1,0 +1,12 @@
+#ifndef CUDA_DENOISE_WEIGHTS_H
+#define CUDA_DENOISE_WEIGHTS_H
+
+namespace weights {
+    {% for weight in weight_list %}
+    const int {{weight["name"]}}_shape[{{weight["data"].shape|length}}] = { {% for i in weight["data"].shape %}{{i}}, {%endfor%}};
+    const float {{weight["name"]}}_data {% for i in weight["data"].shape %}[{{i}}]{%endfor%} = { {% for i in weight["data"].flatten() %} {{i}}, {% endfor %}};
+    const float {{weight["name"]}}_bias {% for i in weight["bias"].shape %}[{{i}}]{%endfor%} = { {% for i in weight["bias"].flatten() %} {{i}}, {% endfor %}};
+    {% endfor %}
+}
+
+#endif //CUDA_DENOISE_WEIGHTS_H

@@ -1,0 +1,199 @@
+//
+// Created by locks on 01.06.2022.
+//
+
+#include <iostream>
+#include <opencv2/core.hpp>
+#include <opencv2/imgcodecs.hpp>
+#include <cuda.h>
+#include <fstream>
+#include "weights.h"
+#include "methods.h"
+
+int main(int argc, char** argv) {
+    if (argc < 2) {
+        std::cout << "Usage: ./cuda_denoise <src_img>" << std::endl;
+        return 0;
+    }
+    std::string fname_in(argv[1]);
+    cv::Mat src_img = cv::imread(fname_in, cv::IMREAD_GRAYSCALE);
+    cv::Mat float_test, dst;
+    src_img.convertTo(float_test, CV_32FC1, 1.f/255);
+
+    int measure_time = 0;
+    int passes = 1;
+    if (argc == 4 && std::string(argv[2]) == "-benchmark") {
+        measure_time = 1;
+        passes = std::atoi(argv[3]);
+    }
+
+    float* cuda_src;
+    float* cuda_dst;
+    int h;
+    int w;
+    int c;
+    int dst_h, dst_w, dst_c;
+    int conv_size;
+    float* kernel;
+    float* bias;
+    dim3 grid_size, block_size;
+
+    cudaDeviceSetLimit(cudaLimitMallocHeapSize, 512 * 1024 * 1024);
+    parseCudaResult("select device", cudaSetDevice(0));
+    cudaEvent_t all_start, all_stop;
+    if (measure_time) {
+        cudaEventCreate(&all_start);
+        cudaEventCreate(&all_stop);
+        cudaEventRecord(all_start);
+    }
+
+    for (int p = 0; p < passes; ++p) {
+        h = float_test.rows;
+        w = float_test.cols;
+        c = 1;
+
+        parseCudaResult("alloc cuda src", cudaMalloc(&cuda_src, h * w * sizeof(float)));
+        parseCudaResult("src memcpy", cudaMemcpy(cuda_src, float_test.ptr(), sizeof(float) * h * w, cudaMemcpyHostToDevice));
+
+        {% for layer in layer_list %}
+        {% if layer["type"] == "conv" %}
+        {% if layer["pad"] == 1 %}
+        dst_h = h + 2;
+        dst_w = w + 2;
+        dst_c = c;
+        parseCudaResult("malloc dst zp", cudaMalloc(&cuda_dst, dst_h * dst_w * dst_c * sizeof(float)));
+        parseCudaResult("memset dst zp", cudaMemset(cuda_dst, 0, dst_h * dst_w * dst_c * sizeof(float)));
+        grid_size = dim3(dst_w / BLOCK_SIZE + 1, dst_h / BLOCK_SIZE + 1);
+        block_size = dim3(BLOCK_SIZE, BLOCK_SIZE);
+        zero_pad<<<grid_size, block_size>>>(cuda_src, h, w, c, cuda_dst, dst_h, dst_w, dst_c);
+        parseCudaResult("free src", cudaFree(cuda_src));
+        cuda_src = cuda_dst;
+        h = dst_h;
+        w = dst_w;
+        c = dst_c;
+        {% endif %}
+        dst_h = h - weights::{{layer["name"]}}_shape[1] + 1;
+        dst_w = w - weights::{{layer["name"]}}_shape[2] + 1;
+        dst_c = weights::{{layer["name"]}}_shape[0];
+        conv_size = weights::{{layer["name"]}}_shape[0] * weights::{{layer["name"]}}_shape[1] * weights::{{layer["name"]}}_shape[2] * weights::{{layer["name"]}}_shape[3];
+        parseCudaResult("alloc kernel", cudaMalloc(&kernel, conv_size * sizeof(float)));
+        parseCudaResult("kernel memcpy", cudaMemcpy(kernel, weights::{{layer["name"]}}_data, conv_size * sizeof(float), cudaMemcpyHostToDevice));
+        parseCudaResult("alloc kernel bias", cudaMalloc(&bias, dst_c * sizeof(float)));
+        parseCudaResult("kernel bias memcpy", cudaMemcpy(bias, weights::{{layer["name"]}}_bias, dst_c * sizeof(float), cudaMemcpyHostToDevice));
+        parseCudaResult("malloc dst zp", cudaMalloc(&cuda_dst, dst_h * dst_w * dst_c * sizeof(float)));
+        grid_size = dim3(dst_w / BLOCK_SIZE + 1, dst_h / BLOCK_SIZE + 1);
+        block_size = dim3(BLOCK_SIZE, BLOCK_SIZE);
+        convkxk<<<grid_size, block_size>>>(cuda_src, h, w, c, kernel, bias, weights::{{layer["name"]}}_shape[1], weights::{{layer["name"]}}_shape[2], cuda_dst, dst_h, dst_w, dst_c, {{layer["relu"]}});
+        parseCudaResult("free src", cudaFree(cuda_src));
+        parseCudaResult("kernel free", cudaFree(kernel));
+        parseCudaResult("kernel bias free", cudaFree(bias));
+        cuda_src = cuda_dst;
+        h = dst_h;
+        w = dst_w;
+        c = dst_c;
+        {% endif %}
+        {% if layer["type"] == "maxpool" %}
+        dst_h = h / 2;
+        dst_w = w / 2;
+        dst_c = c;
+        parseCudaResult("malloc dst zp", cudaMalloc(&cuda_dst, dst_h * dst_w * dst_c * sizeof(float)));
+        grid_size = dim3(dst_w / BLOCK_SIZE + 1, dst_h / BLOCK_SIZE + 1);
+        block_size = dim3(BLOCK_SIZE, BLOCK_SIZE);
+        maxpool2d2x2stride2<<<grid_size, block_size>>>(cuda_src, h, w, c, cuda_dst, dst_h, dst_w, dst_c);
+        parseCudaResult("free src", cudaFree(cuda_src));
+        cuda_src = cuda_dst;
+        h = dst_h;
+        w = dst_w;
+        c = dst_c;
+        {% endif %}
+        {% if layer["type"] == "transposedconv" %}
+        dst_h = 2 * h + 3;
+        dst_w = 2 * w + 3;
+        dst_c = c;
+        parseCudaResult("malloc dst zp", cudaMalloc(&cuda_dst, dst_h * dst_w * dst_c * sizeof(float)));
+        parseCudaResult("memset dst zp", cudaMemset(cuda_dst, 0, dst_h * dst_w * dst_c * sizeof(float)));
+        grid_size = dim3(w / BLOCK_SIZE + 1, h / BLOCK_SIZE + 1);
+        block_size = dim3(BLOCK_SIZE, BLOCK_SIZE);
+        transposepad<<<grid_size, block_size>>>(cuda_src, h, w, c, cuda_dst, dst_h, dst_w, dst_c);
+        parseCudaResult("free src", cudaFree(cuda_src));
+        cuda_src = cuda_dst;
+        h = dst_h;
+        w = dst_w;
+        c = dst_c;
+        
+        dst_h = h - weights::{{layer["name"]}}_shape[1] + 1;
+        dst_w = w - weights::{{layer["name"]}}_shape[2] + 1;
+        dst_c = weights::{{layer["name"]}}_shape[0];
+        conv_size = weights::{{layer["name"]}}_shape[0] * weights::{{layer["name"]}}_shape[1] * weights::{{layer["name"]}}_shape[2] * weights::{{layer["name"]}}_shape[3];
+        parseCudaResult("alloc kernel", cudaMalloc(&kernel, conv_size * sizeof(float)));
+        parseCudaResult("kernel memcpy", cudaMemcpy(kernel, weights::{{layer["name"]}}_data, conv_size * sizeof(float), cudaMemcpyHostToDevice));
+        parseCudaResult("alloc kernel bias", cudaMalloc(&bias, dst_c * sizeof(float)));
+        parseCudaResult("kernel bias memcpy", cudaMemcpy(bias, weights::{{layer["name"]}}_bias, dst_c * sizeof(float), cudaMemcpyHostToDevice));
+        parseCudaResult("malloc dst zp", cudaMalloc(&cuda_dst, dst_h * dst_w * dst_c * sizeof(float)));
+        grid_size = dim3(dst_w / BLOCK_SIZE + 1, dst_h / BLOCK_SIZE + 1);
+        block_size = dim3(BLOCK_SIZE, BLOCK_SIZE);
+        convkxk<<<grid_size, block_size>>>(cuda_src, h, w, c, kernel, bias, weights::{{layer["name"]}}_shape[1], weights::{{layer["name"]}}_shape[2], cuda_dst, dst_h, dst_w, dst_c, {{layer["relu"]}});
+        parseCudaResult("free src", cudaFree(cuda_src));
+        parseCudaResult("kernel free", cudaFree(kernel));
+        parseCudaResult("kernel bias free", cudaFree(bias));
+        cuda_src = cuda_dst;
+        h = dst_h;
+        w = dst_w;
+        c = dst_c;
+        {% endif %}
+        {% if layer["type"] == "sigmoid" %}
+        dst_h = h;
+        dst_w = w;
+        dst_c = c;
+        parseCudaResult("malloc dst zp", cudaMalloc(&cuda_dst, dst_h * dst_w * dst_c * sizeof(float)));
+        grid_size = dim3(dst_w / BLOCK_SIZE + 1, dst_h / BLOCK_SIZE + 1);
+        block_size = dim3(BLOCK_SIZE, BLOCK_SIZE);
+        sigmoid<<<grid_size, block_size>>>(cuda_src, h, w, c, cuda_dst, dst_h, dst_w, dst_c);
+        parseCudaResult("free src", cudaFree(cuda_src));
+        cuda_src = cuda_dst;
+        h = dst_h;
+        w = dst_w;
+        c = dst_c;
+        {% endif %}
+        {% if layer["type"] == "relu" %}
+        dst_h = h;
+        dst_w = w;
+        dst_c = c;
+        parseCudaResult("malloc dst zp", cudaMalloc(&cuda_dst, dst_h * dst_w * dst_c * sizeof(float)));
+        grid_size = dim3(dst_w / BLOCK_SIZE + 1, dst_h / BLOCK_SIZE + 1);
+        block_size = dim3(BLOCK_SIZE, BLOCK_SIZE);
+        relu<<<grid_size, block_size>>>(cuda_src, h, w, c, cuda_dst, dst_h, dst_w, dst_c);
+        parseCudaResult("free src", cudaFree(cuda_src));
+        cuda_src = cuda_dst;
+        h = dst_h;
+        w = dst_w;
+        c = dst_c;
+        {% endif %}
+        {% endfor %}
+
+        dst = cv::Mat(dst_h, dst_w, CV_32FC1);
+        parseCudaResult("memcpy dst",
+                        cudaMemcpy(dst.ptr(), cuda_dst, dst_h * dst_w * dst_c * sizeof(float), cudaMemcpyDeviceToHost));
+        parseCudaResult("free dst", cudaFree(cuda_dst));
+    }
+
+    if (measure_time) {
+        cudaEventRecord(all_stop);
+        float all_ms;
+        parseCudaResult("calc total elapsed time", cudaEventElapsedTime(&all_ms, all_start, all_stop));
+        all_ms /= (float) passes;
+
+        std::cout << "Calculated " << passes << " passes. Average execution time: " << all_ms << " ms" << std::endl;
+    }
+
+    std::string::size_type ext_pos = fname_in.find(".png");
+    std::string ext = std::string(".png");
+    if (ext_pos == std::string::npos) {
+        ext_pos = fname_in.find(".jpg");
+        ext = std::string(".jpg");
+    }
+    std::string mod = std::string("_denoised") + ext;
+    fname_in.replace(ext_pos, mod.length(), mod);
+    cv::imwrite(fname_in.c_str(), dst.mul(255.f));
+    return 0;
+}
